@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>PerAppVolume</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.zcode.perappvolume</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PerAppVolume</string>
+	<key>CFBundleDisplayName</key>
+	<string>App Volume</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<!-- The current build targets macOS 15 (Swift 6 Synchronization). The
+	     underlying process-tap API requires macOS 14.2+. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<!-- NSAudioCaptureUsageDescription: required for Core Audio system-audio
+	     capture on macOS 14.4+. Without it, taps capture only silence. -->
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>App Volume captures system audio (each app's output) to control volume per app. Audio is processed locally only and never leaves this machine.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 PerAppVolume Dev</string>
+</dict>
+</plist>
