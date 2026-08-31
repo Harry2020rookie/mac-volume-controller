@@ -116,6 +116,9 @@ enum CASystem {
 
     /// PID → process object.
     static func processObject(forPID pid: Int32) -> AudioObjectID {
+        // NSRunningApplication can report a negative PID for apps that are
+        // terminating; UInt32 would trap on it.
+        guard pid > 0 else { return AudioObjectID(kAudioObjectUnknown) }
         var p = UInt32(pid)
         return withUnsafePointer(to: &p) {
             CA.scalarQualified(CA.systemObject,
