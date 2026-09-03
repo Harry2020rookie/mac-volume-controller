@@ -19,6 +19,26 @@ final class RingIndex: @unchecked Sendable {
     let read = Atomic<UInt64>(0)
 }
 
+/// Realtime diagnostics counters: written by the IOProcs, polled by the main
+/// thread (refresh) and reported via NSLog. Reporting only — never read back
+/// by the audio path, so they cannot affect behaviour.
+final class DiagCounters: @unchecked Sendable {
+    /// IOProc A: times the ring had no room and a whole callback was dropped.
+    let ringDrops = Atomic<UInt64>(0)
+    /// IOProc A: stereo samples dropped because the ring was full.
+    let droppedSamples = Atomic<UInt64>(0)
+    /// IOProc B: times a device callback could not be fully served from the ring.
+    let underruns = Atomic<UInt64>(0)
+    /// IOProc B: device frames emitted as silence because the ring was short.
+    let starvedFrames = Atomic<UInt64>(0)
+    /// IOProc B: device tick at the most recent underrun (0 = none yet).
+    let lastUnderrunTick = Atomic<UInt64>(0)
+    /// IOProc B: ring fill in stereo samples at callback start.
+    let ringFill = Atomic<UInt64>(0)
+    /// IOProc B: frames the output device asks for per callback.
+    let devFramesPerCallback = Atomic<UInt64>(0)
+}
+
 /// Audio engine:
 /// 1. Creates a private process tap (mutedWhenTapped) for every audio process —
 ///    the app's sound is muted at the source while being captured by the tap.
@@ -47,6 +67,9 @@ final class AudioEngine {
     /// Ring buffer: 2^15 samples (16384 stereo frames ≈ 340 ms at 48 kHz); a
     /// power of two so modulo wraps are cheap.
     private static let ringSize = 1 << 15
+    /// Start playback with enough queued audio to absorb callback jitter. The
+    /// output resampler then keeps the queue near this level as clocks drift.
+    private static let targetRingFrames = 4096
 
     // MARK: - Realtime-thread shared state (IOProcs touch only raw pointers/atomics)
 
@@ -58,6 +81,11 @@ final class AudioEngine {
     private let scratch = UnsafeMutablePointer<Float>.allocate(capacity: 2048 * 2)
     private let ring = UnsafeMutablePointer<Float>.allocate(capacity: ringSize)
     private let ringIndex = RingIndex()
+    private let diag = DiagCounters()
+    /// IOProc B owns these after start; the main thread resets them while the
+    /// device is stopped during rebuild.
+    private let resamplePhase = UnsafeMutablePointer<Double>.allocate(capacity: 1)
+    private let outputPrimed = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
     /// Incremented by IOProc A / B on every callback (watchdog input).
     private let tapIOTick = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
     private let devIOTick = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
@@ -85,6 +113,14 @@ final class AudioEngine {
     private var lastDevTickSeen: UInt64 = 0
     private var lastTapTickTime = Date()
     private var lastDevTickTime = Date()
+    // Diagnostic poll state (main thread only; logging has no effect on audio).
+    private var lastPolledUnderruns: UInt64 = 0
+    private var lastPolledRingDrops: UInt64 = 0
+    private var lastPolledTapTick: UInt64 = 0
+    private var lastPolledDevTick: UInt64 = 0
+    private var starvedSince: Date?
+    private var lastStarvedLog = Date()
+    private var lastEventLog = Date(timeIntervalSince1970: 0)
     /// Last observed screen-recording permission; a change forces a rebuild so a
     /// fresh grant takes effect without relaunching.
     private var lastPermissionOK: Bool?
@@ -104,6 +140,8 @@ final class AudioEngine {
         devInterleaved.pointee = 1
         scratch.initialize(repeating: 0, count: 2048 * 2)
         ring.initialize(repeating: 0, count: Self.ringSize)
+        resamplePhase.pointee = 0
+        outputPrimed.pointee = 0
     }
 
     // No deinit (MainActor-restricted): the pointer memory lives for the process
@@ -235,6 +273,7 @@ final class AudioEngine {
             lastRebuildAttempt = Date()
         }
         checkWatchdog()
+        logDiagnostics()
     }
 
     /// Watchdog: if either IOProc stops firing, tear down and restore native playback.
@@ -256,6 +295,66 @@ final class AudioEngine {
             || now.timeIntervalSince(lastDevTickTime) > Self.watchdogSeconds {
             lastError = "Audio callbacks stalled; restored native playback"
             teardown()
+        }
+    }
+
+    /// Poll the IOProc diagnostics counters and NSLog trouble signs: ring
+    /// starvation (device callbacks that cannot be fully served while both
+    /// IOProcs keep firing — the watchdog cannot see this) and dropped tap
+    /// callbacks. Diagnostic only; never changes audio state.
+    private func logDiagnostics() {
+        guard aggregateID != AudioObjectID(kAudioObjectUnknown), tapCount.pointee > 0 else {
+            // Engine down or native pass-through: nothing to report. Reset the
+            // poll state so the next episode starts from a clean slate.
+            starvedSince = nil
+            lastPolledUnderruns = diag.underruns.load(ordering: .relaxed)
+            lastPolledRingDrops = diag.ringDrops.load(ordering: .relaxed)
+            lastPolledTapTick = tapIOTick.pointee
+            lastPolledDevTick = devIOTick.pointee
+            return
+        }
+
+        let now = Date()
+        let underruns = diag.underruns.load(ordering: .relaxed)
+        let ringDrops = diag.ringDrops.load(ordering: .relaxed)
+        let starvedFrames = diag.starvedFrames.load(ordering: .relaxed)
+        let fill = diag.ringFill.load(ordering: .relaxed)
+        let devFrames = diag.devFramesPerCallback.load(ordering: .relaxed)
+        let tapTick = tapIOTick.pointee
+        let devTick = devIOTick.pointee
+        let tapAdvancing = tapTick != lastPolledTapTick
+        let devAdvancing = devTick != lastPolledDevTick
+        let newUnderruns = underruns &- lastPolledUnderruns
+        let newRingDrops = ringDrops &- lastPolledRingDrops
+        lastPolledUnderruns = underruns
+        lastPolledRingDrops = ringDrops
+        lastPolledTapTick = tapTick
+        lastPolledDevTick = devTick
+
+        // Every underrun records the device tick it happened on; a recent one
+        // means starvation is ongoing right now, not a one-off glitch.
+        let lastUnderrunTick = diag.lastUnderrunTick.load(ordering: .relaxed)
+        let starvingNow = lastUnderrunTick != 0 && (devTick &- lastUnderrunTick) < 10
+
+        if starvingNow {
+            if starvedSince == nil {
+                starvedSince = now
+                NSLog("[PerAppVolume] diag: starvation started: ring fill \(fill)/\(Self.ringSize), device needs \(devFrames)/callback; IOProcs firing tap=\(tapAdvancing ? "y" : "n") dev=\(devAdvancing ? "y" : "n"); silence so far \(starvedFrames) frames")
+            } else if now.timeIntervalSince(lastStarvedLog) > 10, let since = starvedSince {
+                lastStarvedLog = now
+                NSLog("[PerAppVolume] diag: still starving for \(Int(now.timeIntervalSince(since)))s; +\(newUnderruns) underruns since last poll, ring fill \(fill), cumulative silence \(starvedFrames) frames")
+            }
+        } else {
+            if let since = starvedSince {
+                starvedSince = nil
+                NSLog("[PerAppVolume] diag: starvation ended after \(Int(now.timeIntervalSince(since)))s; cumulative underruns \(underruns), silence inserted \(starvedFrames) frames")
+            }
+            if newUnderruns > 0 || newRingDrops > 0 {
+                if now.timeIntervalSince(lastEventLog) > 30 {
+                    lastEventLog = now
+                    NSLog("[PerAppVolume] diag: transient +\(newUnderruns) underruns, +\(newRingDrops) tap drops since last poll; ring fill \(fill) vs device \(devFrames)/callback")
+                }
+            }
         }
     }
 
@@ -391,6 +490,20 @@ final class AudioEngine {
         }
         aggregateID = aggID
 
+        // A tap-only aggregate otherwise chooses its own nominal rate. On some
+        // boots that differs from the physical output (commonly 44.1 vs 48 kHz),
+        // making the output drain the ring until playback becomes all silence.
+        // Match the rates first; the adaptive output resampler below handles
+        // the remaining clock drift between the independent devices.
+        let outputRate = CADevice.nominalSampleRate(outputDeviceID)
+        if outputRate > 0 {
+            let setRate = CADevice.setNominalSampleRate(aggID, outputRate)
+            let actualRate = CADevice.nominalSampleRate(aggID)
+            if !setRate || abs(actualRate - outputRate) > 0.5 {
+                NSLog("[PerAppVolume] aggregate rate \(actualRate) could not be aligned to output rate \(outputRate); adaptive resampling enabled")
+            }
+        }
+
         // 3) Tap buffer layout.
         let inAddr = CA.address(kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput)
         let inputBufferCount = bufferCount(aggID, inAddr)
@@ -404,6 +517,8 @@ final class AudioEngine {
         }
         ringIndex.write.store(0, ordering: .relaxed)
         ringIndex.read.store(0, ordering: .relaxed)
+        resamplePhase.pointee = 0
+        outputPrimed.pointee = 0
 
         // 5) IOProc A (aggregate input → mix → ring).
         let tapBlock = makeTapMixBlock()
@@ -448,6 +563,12 @@ final class AudioEngine {
         lastDevTickSeen = devIOTick.pointee
         lastTapTickTime = Date()
         lastDevTickTime = Date()
+        // Fresh episode for the diagnostics poll state (counters keep running).
+        lastPolledUnderruns = diag.underruns.load(ordering: .relaxed)
+        lastPolledRingDrops = diag.ringDrops.load(ordering: .relaxed)
+        lastPolledTapTick = tapIOTick.pointee
+        lastPolledDevTick = devIOTick.pointee
+        starvedSince = nil
     }
 
     private func targetsKey(for obj: AudioObjectID) -> String {
@@ -522,6 +643,7 @@ final class AudioEngine {
         let ring = self.ring
         let ringIndex = self.ringIndex
         let ringSize = Self.ringSize
+        let diag = self.diag
 
         return { _, inInputData, _, _, _ in
             tapIOTickP.pointee &+= 1
@@ -540,20 +662,22 @@ final class AudioEngine {
                 guard let inRaw = inBuf.mData else { continue }
                 let inFloats = inRaw.assumingMemoryBound(to: Float.self)
 
-                // Taps are mixdown; infer the channel count from bytes per
-                // frame (2 ch = 8 B/frame, 1 ch = 4 B/frame).
-                let frames = Int(inBuf.mDataByteSize) / 8
+                // AudioBuffer already reports its channel count. Deriving it
+                // from byte size after assuming 8 bytes/frame made the old
+                // mono test always resolve to stereo and could read past mono
+                // buffers.
+                let chIn = max(1, Int(inBuf.mNumberChannels))
+                let frames = Int(inBuf.mDataByteSize) / MemoryLayout<Float>.size / chIn
                 guard frames > 0 else { continue }
-                let chIn = inBuf.mDataByteSize / UInt32(frames) == 4 ? 1 : 2
                 let n = min(frames, 2048)
                 maxFrames = max(maxFrames, n)
                 let g = gains[t]
                 if g == 0 { continue }
 
-                if chIn == 2 {
+                if chIn >= 2 {
                     for f in 0..<n {
-                        scratch[f * 2] += inFloats[f * 2] * g
-                        scratch[f * 2 + 1] += inFloats[f * 2 + 1] * g
+                        scratch[f * 2] += inFloats[f * chIn] * g
+                        scratch[f * 2 + 1] += inFloats[f * chIn + 1] * g
                     }
                 } else {
                     for f in 0..<n {
@@ -570,7 +694,11 @@ final class AudioEngine {
             let used = Int(w &- r)
             let space = ringSize - used
             let samples = maxFrames * 2
-            guard space >= samples else { return }
+            guard space >= samples else {
+                diag.ringDrops.add(1, ordering: .relaxed)
+                diag.droppedSamples.add(UInt64(samples), ordering: .relaxed)
+                return
+            }
             let base = Int(w) & (ringSize - 1)
             let first = min(samples, ringSize - base)
             for i in 0..<first { ring[base + i] = scratch[i] }
@@ -587,6 +715,10 @@ final class AudioEngine {
         let devChannelsP = self.devChannels
         let devInterleavedP = self.devInterleaved
         let devIOTickP = self.devIOTick
+        let resamplePhaseP = self.resamplePhase
+        let outputPrimedP = self.outputPrimed
+        let targetFrames = Self.targetRingFrames
+        let diag = self.diag
 
         return { _, _, _, outOutputData, _ in
             devIOTickP.pointee &+= 1
@@ -602,57 +734,103 @@ final class AudioEngine {
                 framesOut = Int(outBL[0].mDataByteSize) / 4
             }
             guard framesOut > 0 else { return }
+            diag.devFramesPerCallback.store(UInt64(framesOut), ordering: .relaxed)
 
             let r = ringIndex.read.load(ordering: .relaxed)
             let w = ringIndex.write.load(ordering: .acquiring)
             let avail = Int(w &- r) / 2   // available frames (stereo)
-            let take = min(avail, framesOut)
+            diag.ringFill.store(UInt64(avail * 2), ordering: .relaxed)
+
+            // Always clear the complete hardware buffer first. This is also
+            // correct for mono and interleaved devices with more than 2 channels.
+            if interleaved {
+                if let raw = outBL[0].mData {
+                    memset(raw, 0, Int(outBL[0].mDataByteSize))
+                }
+            } else {
+                for c in 0..<outBL.count {
+                    if let raw = outBL[c].mData {
+                        memset(raw, 0, Int(outBL[c].mDataByteSize))
+                    }
+                }
+            }
+
+            // Do not begin at an empty ring: prefill once so normal scheduling
+            // jitter cannot immediately cause a repeating underrun.
+            if outputPrimedP.pointee == 0 {
+                guard avail >= targetFrames else { return }
+                outputPrimedP.pointee = 1
+                resamplePhaseP.pointee = 0
+            }
+
+            // Proportional queue controller. At the target it consumes exactly
+            // one captured frame per output frame. If the ring drains/fills, a
+            // bounded linear resampler consumes slightly slower/faster. The wide
+            // bound also survives a 44.1/48 kHz mismatch if HAL rejected the
+            // aggregate-rate request.
+            let fillError = Double(avail - targetFrames) / Double(targetFrames)
+            let ratio = min(1.15, max(0.85, 1.0 + fillError * 0.25))
+            let startPhase = resamplePhaseP.pointee
+            var produced = 0
+            if avail >= 2 {
+                let maxPosition = Double(avail - 1)
+                while produced < framesOut,
+                      startPhase + Double(produced) * ratio < maxPosition {
+                    produced += 1
+                }
+            }
+            if produced < framesOut {
+                diag.underruns.add(1, ordering: .relaxed)
+                diag.starvedFrames.add(UInt64(framesOut - produced), ordering: .relaxed)
+                diag.lastUnderrunTick.store(devIOTickP.pointee, ordering: .relaxed)
+            }
             let base = Int(r) & (ringSize - 1)
+
+            @inline(__always) func ringSample(_ frame: Int, _ channel: Int) -> Float {
+                ring[(base + frame * 2 + channel) & (ringSize - 1)]
+            }
+
+            @inline(__always) func interpolated(_ outputFrame: Int, _ channel: Int) -> Float {
+                let position = startPhase + Double(outputFrame) * ratio
+                let frame = Int(position)
+                let fraction = Float(position - Double(frame))
+                let a = ringSample(frame, channel)
+                return a + (ringSample(frame + 1, channel) - a) * fraction
+            }
 
             if interleaved {
                 guard let dstRaw = outBL[0].mData else { return }
                 let dst = dstRaw.assumingMemoryBound(to: Float.self)
-                var f = 0
-                if chOut >= 2 {
-                    while f < take {
-                        let ri = base + f * 2
-                        let li = ri >= ringSize ? ri - ringSize : ri
-                        dst[f * 2] = ring[li]
-                        dst[f * 2 + 1] = ring[li + 1 >= ringSize ? li + 1 - ringSize : li + 1]
-                        f += 1
+                if chOut == 1 {
+                    for f in 0..<produced {
+                        dst[f] = (interpolated(f, 0) + interpolated(f, 1)) * 0.5
                     }
                 } else {
-                    while f < take {
-                        let ri = base + f * 2
-                        let li = ri >= ringSize ? ri - ringSize : ri
-                        let l = ring[li]
-                        let rr = ring[li + 1 >= ringSize ? li + 1 - ringSize : li + 1]
-                        dst[f] = (l + rr) * 0.5
-                        f += 1
+                    for f in 0..<produced {
+                        dst[f * chOut] = interpolated(f, 0)
+                        dst[f * chOut + 1] = interpolated(f, 1)
                     }
                 }
-                for i in f * 2..<framesOut * 2 { dst[i] = 0 }
             } else {
                 // Non-interleaved: one buffer per channel.
                 for c in 0..<min(chOut, outBL.count) {
                     guard let dstRaw = outBL[c].mData else { continue }
                     let dst = dstRaw.assumingMemoryBound(to: Float.self)
-                    for f in 0..<framesOut { dst[f] = 0 }
                     if c < 2 {
-                        for f in 0..<take {
-                            let ri = base + f * 2
-                            let li = ri >= ringSize ? ri - ringSize : ri
-                            dst[f] = ring[li + (c == 1 ? 1 : 0) >= ringSize
-                                ? li + (c == 1 ? 1 : 0) - ringSize
-                                : li + (c == 1 ? 1 : 0)]
+                        for f in 0..<produced {
+                            dst[f] = interpolated(f, c)
                         }
                     }
                 }
             }
 
-            // Advance the read pointer.
-            if take > 0 {
-                ringIndex.read.store(r &+ UInt64(take * 2), ordering: .releasing)
+            // Keep the fractional source position for the next callback and
+            // advance only by complete captured frames.
+            if produced > 0 {
+                let endPhase = startPhase + Double(produced) * ratio
+                let consumed = min(Int(endPhase), max(0, avail - 1))
+                resamplePhaseP.pointee = endPhase - Double(consumed)
+                ringIndex.read.store(r &+ UInt64(consumed * 2), ordering: .releasing)
             }
         }
     }

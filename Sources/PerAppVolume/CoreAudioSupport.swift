@@ -157,6 +157,16 @@ enum CADevice {
         allDeviceIDs().filter { isOutputDevice($0) }
     }
 
+    static func nominalSampleRate(_ id: AudioObjectID) -> Double {
+        CA.scalar(id, CA.address(kAudioDevicePropertyNominalSampleRate), Double(0))
+    }
+
+    @discardableResult
+    static func setNominalSampleRate(_ id: AudioObjectID, _ rate: Double) -> Bool {
+        guard rate > 0 else { return false }
+        return CA.setScalar(id, CA.address(kAudioDevicePropertyNominalSampleRate), rate)
+    }
+
     static func allDeviceIDs() -> [AudioObjectID] {
         CASystem.allDeviceIDs()
     }

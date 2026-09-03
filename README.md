@@ -95,6 +95,21 @@ Notes:
 - DRM-protected content (some streaming media) may not be capturable; such apps
   keep native playback.
 
+## Diagnostics
+
+While intercepting, the engine reports IOProc health to the unified log under
+`[PerAppVolume] diag:` (Console app, or `log stream --predicate 'eventMessage
+CONTAINS "PerAppVolume"'`). These lines are reporting only — nothing in the
+engine reacts to them:
+
+- `starvation started / still starving / starvation ended`: device callbacks
+  that could not be fully served from the ring while both IOProcs kept firing —
+  the signature of ring underrun that the watchdog (which only detects stopped
+  callbacks) cannot see. Includes ring fill vs. the device buffer size and
+  cumulative silence frames.
+- `transient +N underruns, +M tap drops`: occasional shortfalls that
+  self-healed, plus tap-side drops when the ring was full.
+
 ## License
 
 [MIT](LICENSE)
