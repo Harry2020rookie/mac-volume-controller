@@ -3,6 +3,33 @@ import CoreAudio
 import Foundation
 import Synchronization
 
+/// Minimal file logger for engine diagnostics. Main-thread call sites only —
+/// never called from the IOProc callbacks. Writes to
+/// ~/Library/Logs/PerAppVolume-diag.log because NSLog/unified-log capture
+/// proved unreliable on some systems.
+enum DiagLog {
+    private static let lock = NSLock()
+
+    static func log(_ message: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let comps = Calendar.current.dateComponents([.hour, .minute, .second, .nanosecond], from: Date())
+        let ms = (comps.nanosecond ?? 0) / 1_000_000
+        let line = String(format: "[%02d:%02d:%02d.%03d] %@\n",
+                          comps.hour ?? 0, comps.minute ?? 0, comps.second ?? 0, ms, message)
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/PerAppVolume-diag.log")
+        guard let data = line.data(using: .utf8) else { return }
+        if let h = try? FileHandle(forWritingTo: url) {
+            defer { try? h.close() }
+            h.seekToEndOfFile()
+            h.write(data)
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
 /// An app shown in the UI. A parent app may aggregate several audio processes
 /// (e.g. Chrome and its helpers) that share one gain.
 struct TrackedApp: Identifiable {
@@ -35,6 +62,10 @@ final class DiagCounters: @unchecked Sendable {
     let lastUnderrunTick = Atomic<UInt64>(0)
     /// IOProc B: ring fill in stereo samples at callback start.
     let ringFill = Atomic<UInt64>(0)
+    /// IOProc B: min/max ring fill since the main thread last reset them
+    /// (quantization wobble of the queue controller is visible as fill range).
+    let fillMin = Atomic<UInt64>(0)
+    let fillMax = Atomic<UInt64>(0)
     /// IOProc B: frames the output device asks for per callback.
     let devFramesPerCallback = Atomic<UInt64>(0)
 }
@@ -71,6 +102,33 @@ final class AudioEngine {
     /// output resampler then keeps the queue near this level as clocks drift.
     private static let targetRingFrames = 4096
 
+    /// System processes observed on this machine that register output devices
+    /// without producing user-controllable media audio (audio infrastructure,
+    /// Siri, calls, remote control, system sounds). Tapping them adds no value,
+    /// and their process objects come and go — each change forces an audible
+    /// full rebuild. Machine-derived list; extend it when the diag rebuild log
+    /// shows a new churner.
+    private static let excludedBundles: Set<String> = [
+        "com.apple.audiomxd",
+        "com.apple.mediaremoted",
+        "com.apple.cmio.continuitycaptureagent",
+        "com.apple.controlcenter",
+        "com.apple.universalaccessd",
+        "com.apple.corespeech",
+        "com.apple.accessibility.heard",
+        "com.apple.telephonyutilities",
+        "com.apple.assistantd",
+        "com.apple.avconferenced",
+        "com.apple.sirincservice",
+        "com.apple.loginwindow",
+        "com.apple.cloudpaird",
+        "com.apple.ampdevicesagent",
+        "pro.betterdisplay.betterdisplay",
+        "com.rogueamoeba.arkaudiod",
+        "com.oray.sunlogin.macclient.agent",
+        "systemsoundserverd",
+    ]
+
     // MARK: - Realtime-thread shared state (IOProcs touch only raw pointers/atomics)
 
     private let gains = UnsafeMutablePointer<Float>.allocate(capacity: maxTaps)
@@ -102,6 +160,10 @@ final class AudioEngine {
 
     private var slotOwnerKey: [String] = []
     private var tappedObjs: [AudioObjectID] = []
+    /// Process objects accepted into the tap set. A tracked object stays
+    /// tracked while it lives (so pausing an app does not rebuild); new
+    /// objects must actually be outputting before they are tracked.
+    private var trackedObjects: Set<AudioObjectID> = []
     private var objKeys: [AudioObjectID: String] = [:]
     private var tapIDs: [AudioObjectID] = []
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
@@ -121,6 +183,10 @@ final class AudioEngine {
     private var starvedSince: Date?
     private var lastStarvedLog = Date()
     private var lastEventLog = Date(timeIntervalSince1970: 0)
+    // Steady-state telemetry state (ring write/read rate measurement).
+    private var lastStatusTime = Date()
+    private var lastStatusWrite: UInt64 = 0
+    private var lastStatusRead: UInt64 = 0
     /// Last observed screen-recording permission; a change forces a rebuild so a
     /// fresh grant takes effect without relaunching.
     private var lastPermissionOK: Bool?
@@ -219,18 +285,34 @@ final class AudioEngine {
 
         var grouped: [String: (name: String, icon: NSImage?, bundle: String?)] = [:]
         var targets: [AudioObjectID] = []
-        for proc in CASystem.processObjectIDs() {
+        let currentObjs = CASystem.processObjectIDs()
+        // Forget process objects that left the HAL (object ids can be recycled).
+        trackedObjects.formIntersection(Set(currentObjs))
+        for proc in currentObjs {
             guard proc != ourProcessObj else { continue }
             // Skip our own process (by bundle id in app mode).
             if let b = CAProcess.bundleID(proc)?.lowercased(), b == ownBundleID {
+                continue
+            }
+            // Skip system/agent processes that never produce user-controllable
+            // media audio (see excludedBundles).
+            let bundle = CAProcess.bundleID(proc)
+            if let b = bundle?.lowercased(), Self.excludedBundles.contains(b) {
                 continue
             }
             // Skip processes outputting to other devices (e.g. Bluetooth-only)
             // to avoid double playback.
             let devices = CADevice.outputDevices(ofProcess: proc)
             if !devices.isEmpty && !devices.contains(outputDeviceID) { continue }
+            // Gate new processes on actually producing output: agents that only
+            // register an output device (AMPDevicesAgent, …) come and go, and
+            // each change would otherwise force an audible full rebuild.
+            // Tracked processes stay tracked while alive, so pausing an app
+            // does not rebuild.
+            if !trackedObjects.contains(proc) && !CAProcess.isRunningOutput(proc) {
+                continue
+            }
 
-            let bundle = CAProcess.bundleID(proc)
             let pid = pidByObj[proc]
             let parent = parentApp(forBundle: bundle, pid: pid)
             let key = gainKey(forBundle: bundle, pid: pid, obj: proc, parent: parent)
@@ -255,6 +337,7 @@ final class AudioEngine {
             objKeys[proc] = key
             targets.append(proc)
         }
+        trackedObjects = Set(targets)
 
         apps = grouped.map { key, e in
             TrackedApp(id: key, name: e.name, icon: e.icon, bundleID: e.bundle)
@@ -269,6 +352,22 @@ final class AudioEngine {
 
         let needRebuild = deviceChanged || permissionChanged || Set(targets) != Set(tappedObjs)
         if needRebuild, Date().timeIntervalSince(lastRebuildAttempt) > Self.rebuildBackoff {
+            // Log why (diagnostic only): distinguishes device flapping, screen
+            // recording preflight flapping, and processes entering/leaving the
+            // tap set — the churn that is audible as rebuild noise.
+            let oldSet = Set(tappedObjs)
+            let newSet = Set(targets)
+            let reason: String
+            if deviceChanged {
+                reason = "deviceChanged (output now \(outputDeviceID))"
+            } else if permissionChanged {
+                reason = "permissionChanged (preflight \(permOK ? "granted" : "missing"))"
+            } else {
+                let left = oldSet.subtracting(newSet)
+                let joined = newSet.subtracting(oldSet)
+                reason = "targetsChanged (-\(left.count) left +\(joined.count) joined)"
+            }
+            DiagLog.log("[PerAppVolume] diag: rebuild: \(reason); taps \(oldSet.count)→\(newSet.count)")
             rebuild(targets: targets)
             lastRebuildAttempt = Date()
         }
@@ -293,6 +392,9 @@ final class AudioEngine {
         }
         if now.timeIntervalSince(lastTapTickTime) > Self.watchdogSeconds
             || now.timeIntervalSince(lastDevTickTime) > Self.watchdogSeconds {
+            let tapStalled = now.timeIntervalSince(lastTapTickTime) > Self.watchdogSeconds
+            let devStalled = now.timeIntervalSince(lastDevTickTime) > Self.watchdogSeconds
+            DiagLog.log("[PerAppVolume] diag: watchdog fired (tapStalled=\(tapStalled) devStalled=\(devStalled)); restoring native playback")
             lastError = "Audio callbacks stalled; restored native playback"
             teardown()
         }
@@ -339,22 +441,47 @@ final class AudioEngine {
         if starvingNow {
             if starvedSince == nil {
                 starvedSince = now
-                NSLog("[PerAppVolume] diag: starvation started: ring fill \(fill)/\(Self.ringSize), device needs \(devFrames)/callback; IOProcs firing tap=\(tapAdvancing ? "y" : "n") dev=\(devAdvancing ? "y" : "n"); silence so far \(starvedFrames) frames")
+                DiagLog.log("[PerAppVolume] diag: starvation started: ring fill \(fill)/\(Self.ringSize), device needs \(devFrames)/callback; IOProcs firing tap=\(tapAdvancing ? "y" : "n") dev=\(devAdvancing ? "y" : "n"); silence so far \(starvedFrames) frames")
             } else if now.timeIntervalSince(lastStarvedLog) > 10, let since = starvedSince {
                 lastStarvedLog = now
-                NSLog("[PerAppVolume] diag: still starving for \(Int(now.timeIntervalSince(since)))s; +\(newUnderruns) underruns since last poll, ring fill \(fill), cumulative silence \(starvedFrames) frames")
+                DiagLog.log("[PerAppVolume] diag: still starving for \(Int(now.timeIntervalSince(since)))s; +\(newUnderruns) underruns since last poll, ring fill \(fill), cumulative silence \(starvedFrames) frames")
             }
         } else {
             if let since = starvedSince {
                 starvedSince = nil
-                NSLog("[PerAppVolume] diag: starvation ended after \(Int(now.timeIntervalSince(since)))s; cumulative underruns \(underruns), silence inserted \(starvedFrames) frames")
+                DiagLog.log("[PerAppVolume] diag: starvation ended after \(Int(now.timeIntervalSince(since)))s; cumulative underruns \(underruns), silence inserted \(starvedFrames) frames")
             }
             if newUnderruns > 0 || newRingDrops > 0 {
                 if now.timeIntervalSince(lastEventLog) > 30 {
                     lastEventLog = now
-                    NSLog("[PerAppVolume] diag: transient +\(newUnderruns) underruns, +\(newRingDrops) tap drops since last poll; ring fill \(fill) vs device \(devFrames)/callback")
+                    DiagLog.log("[PerAppVolume] diag: transient +\(newUnderruns) underruns, +\(newRingDrops) tap drops since last poll; ring fill \(fill) vs device \(devFrames)/callback")
                 }
             }
+        }
+
+        // Steady-state telemetry (10 s cadence): actual ring delivery rate of
+        // IOProc A vs consumption of IOProc B. A constant mismatch (e.g. the
+        // tap aggregate running at 44.1 kHz while the output device runs at
+        // 48 kHz) keeps the output resampler permanently off 1:1 — audible as
+        // veiled quality without any starvation events. The fill range shows
+        // queue-controller quantization wobble per callback.
+        if now.timeIntervalSince(lastStatusTime) > 10 {
+            let w = ringIndex.write.load(ordering: .relaxed)
+            let r = ringIndex.read.load(ordering: .relaxed)
+            let dt = max(now.timeIntervalSince(lastStatusTime), 0.001)
+            let fMin = diag.fillMin.load(ordering: .relaxed)
+            let fMax = diag.fillMax.load(ordering: .relaxed)
+            diag.fillMin.store(0, ordering: .relaxed)
+            diag.fillMax.store(0, ordering: .relaxed)
+            if lastStatusWrite != 0 {
+                let writeRate = Double(w &- lastStatusWrite) / dt / 2   // per-channel Hz
+                let readRate = Double(r &- lastStatusRead) / dt / 2
+                DiagLog.log(String(format: "[PerAppVolume] status: A %.0f Hz, B %.0f Hz, fill %d..%d samples (target %d), dev %d/cb",
+                                   writeRate, readRate, fMin, fMax, Self.targetRingFrames * 2, devFrames))
+            }
+            lastStatusTime = now
+            lastStatusWrite = w
+            lastStatusRead = r
         }
     }
 
@@ -415,6 +542,7 @@ final class AudioEngine {
     private func rebuild(targets: [AudioObjectID]) {
         // Fail open without screen-recording permission: never intercept audio.
         if !CGPreflightScreenCaptureAccess() {
+            DiagLog.log("[PerAppVolume] diag: rebuild skipped: screen recording permission missing")
             lastError = "Screen Recording permission required: System Settings → Privacy & Security → Screen Recording"
             teardownTaps()
             tappedObjs = []
@@ -447,7 +575,7 @@ final class AudioEngine {
             let status = AudioHardwareCreateProcessTap(desc, &tapID)
             guard status == noErr, tapID != AudioObjectID(kAudioObjectUnknown),
                   let uid = CATap2.uid(tapID) else {
-                NSLog("[PerAppVolume] failed to create tap obj=\(obj) status=\(status)")
+                DiagLog.log("[PerAppVolume] failed to create tap obj=\(obj) status=\(status)")
                 continue
             }
             newTapIDs.append(tapID)
@@ -461,7 +589,7 @@ final class AudioEngine {
         tapCount.pointee = Int32(newTapIDs.count)
 
         guard !newTapIDs.isEmpty else {
-            NSLog("[PerAppVolume] no interceptable processes; native playback")
+            DiagLog.log("[PerAppVolume] no interceptable processes; native playback")
             tappedObjs = []
             return
         }
@@ -484,7 +612,7 @@ final class AudioEngine {
         let status = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &aggID)
         guard status == noErr, aggID != AudioObjectID(kAudioObjectUnknown) else {
             lastError = "Failed to create aggregate device: \(status)"
-            NSLog("[PerAppVolume] CreateAggregateDevice failed: \(status)")
+            DiagLog.log("[PerAppVolume] CreateAggregateDevice failed: \(status)")
             teardownTaps()
             return
         }
@@ -500,7 +628,7 @@ final class AudioEngine {
             let setRate = CADevice.setNominalSampleRate(aggID, outputRate)
             let actualRate = CADevice.nominalSampleRate(aggID)
             if !setRate || abs(actualRate - outputRate) > 0.5 {
-                NSLog("[PerAppVolume] aggregate rate \(actualRate) could not be aligned to output rate \(outputRate); adaptive resampling enabled")
+                DiagLog.log("[PerAppVolume] aggregate rate \(actualRate) could not be aligned to output rate \(outputRate); adaptive resampling enabled")
             }
         }
 
@@ -526,7 +654,7 @@ final class AudioEngine {
         let tapCreate = AudioDeviceCreateIOProcIDWithBlock(&tapProc, aggID, nil, tapBlock)
         guard tapCreate == noErr, let tapProc else {
             lastError = "Failed to create aggregate IOProc: \(tapCreate)"
-            NSLog("[PerAppVolume] aggregate IOProc create failed: \(tapCreate)")
+            DiagLog.log("[PerAppVolume] aggregate IOProc create failed: \(tapCreate)")
             teardownAggregate()
             return
         }
@@ -534,7 +662,7 @@ final class AudioEngine {
         let tapStart = AudioDeviceStart(aggID, tapProc)
         guard tapStart == noErr else {
             lastError = "Failed to start aggregate IOProc: \(tapStart)"
-            NSLog("[PerAppVolume] aggregate IOProc start failed: \(tapStart)")
+            DiagLog.log("[PerAppVolume] aggregate IOProc start failed: \(tapStart)")
             teardownAggregate()
             return
         }
@@ -545,7 +673,7 @@ final class AudioEngine {
         let devCreate = AudioDeviceCreateIOProcIDWithBlock(&devProc, outputDeviceID, nil, devBlock)
         guard devCreate == noErr, let devProc else {
             lastError = "Failed to create device IOProc: \(devCreate)"
-            NSLog("[PerAppVolume] device IOProc create failed: \(devCreate)")
+            DiagLog.log("[PerAppVolume] device IOProc create failed: \(devCreate)")
             teardownAggregate()
             return
         }
@@ -553,7 +681,7 @@ final class AudioEngine {
         let devStart = AudioDeviceStart(outputDeviceID, devProc)
         guard devStart == noErr else {
             lastError = "Failed to start device IOProc: \(devStart)"
-            NSLog("[PerAppVolume] device IOProc start failed: \(devStart)")
+            DiagLog.log("[PerAppVolume] device IOProc start failed: \(devStart)")
             teardownAggregate()
             return
         }
@@ -569,6 +697,11 @@ final class AudioEngine {
         lastPolledTapTick = tapIOTick.pointee
         lastPolledDevTick = devIOTick.pointee
         starvedSince = nil
+        lastStatusTime = Date()
+        lastStatusWrite = 0
+        lastStatusRead = 0
+        diag.fillMin.store(0, ordering: .relaxed)
+        diag.fillMax.store(0, ordering: .relaxed)
     }
 
     private func targetsKey(for obj: AudioObjectID) -> String {
@@ -739,7 +872,25 @@ final class AudioEngine {
             let r = ringIndex.read.load(ordering: .relaxed)
             let w = ringIndex.write.load(ordering: .acquiring)
             let avail = Int(w &- r) / 2   // available frames (stereo)
-            diag.ringFill.store(UInt64(avail * 2), ordering: .relaxed)
+            let fillSamples = UInt64(avail * 2)
+            diag.ringFill.store(fillSamples, ordering: .relaxed)
+            // Track the fill range since the main thread last sampled it.
+            var minFill = diag.fillMin.load(ordering: .relaxed)
+            while minFill == 0 || fillSamples < minFill {
+                let (exchanged, _) = diag.fillMin.compareExchange(expected: minFill,
+                                                                  desired: fillSamples,
+                                                                  ordering: .relaxed)
+                if exchanged { break }
+                minFill = diag.fillMin.load(ordering: .relaxed)
+            }
+            var maxFill = diag.fillMax.load(ordering: .relaxed)
+            while fillSamples > maxFill {
+                let (exchanged, _) = diag.fillMax.compareExchange(expected: maxFill,
+                                                                  desired: fillSamples,
+                                                                  ordering: .relaxed)
+                if exchanged { break }
+                maxFill = diag.fillMax.load(ordering: .relaxed)
+            }
 
             // Always clear the complete hardware buffer first. This is also
             // correct for mono and interleaved devices with more than 2 channels.
