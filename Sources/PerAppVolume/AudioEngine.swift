@@ -127,6 +127,10 @@ final class AudioEngine {
         "com.rogueamoeba.arkaudiod",
         "com.oray.sunlogin.macclient.agent",
         "systemsoundserverd",
+        // TEMPORARY: PurePlayer (iOS simulator dev builds) disconnects and
+        // rejoins the audio system every few seconds while its UI tests run,
+        // forcing a full rebuild per cycle. Remove once that dev work settles.
+        "com.gongtenghui.pureplayer",
     ]
 
     // MARK: - Realtime-thread shared state (IOProcs touch only raw pointers/atomics)
@@ -142,7 +146,6 @@ final class AudioEngine {
     private let diag = DiagCounters()
     /// IOProc B owns these after start; the main thread resets them while the
     /// device is stopped during rebuild.
-    private let resamplePhase = UnsafeMutablePointer<Double>.allocate(capacity: 1)
     private let outputPrimed = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
     /// Incremented by IOProc A / B on every callback (watchdog input).
     private let tapIOTick = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
@@ -183,6 +186,9 @@ final class AudioEngine {
     private var starvedSince: Date?
     private var lastStarvedLog = Date()
     private var lastEventLog = Date(timeIntervalSince1970: 0)
+    // Starvation-recovery state (main thread only).
+    private var lastRefillAttempt = Date(timeIntervalSince1970: 0)
+    private var continuousStarvationSince: Date?
     // Steady-state telemetry state (ring write/read rate measurement).
     private var lastStatusTime = Date()
     private var lastStatusWrite: UInt64 = 0
@@ -206,7 +212,6 @@ final class AudioEngine {
         devInterleaved.pointee = 1
         scratch.initialize(repeating: 0, count: 2048 * 2)
         ring.initialize(repeating: 0, count: Self.ringSize)
-        resamplePhase.pointee = 0
         outputPrimed.pointee = 0
     }
 
@@ -372,10 +377,14 @@ final class AudioEngine {
             lastRebuildAttempt = Date()
         }
         checkWatchdog()
+        checkStarvationRecovery()
         logDiagnostics()
     }
 
-    /// Watchdog: if either IOProc stops firing, tear down and restore native playback.
+    /// Watchdog: if either IOProc stops firing, tear down and restore native
+    /// playback, then allow one rebuild attempt after a cooldown so the engine
+    /// does not stay dead (and per-app mute useless) until the next manual
+    /// restart. Repeated stalls re-enter this path and back off again.
     private func checkWatchdog() {
         guard aggregateID != AudioObjectID(kAudioObjectUnknown),
               tapCount.pointee > 0 else { return }
@@ -397,7 +406,50 @@ final class AudioEngine {
             DiagLog.log("[PerAppVolume] diag: watchdog fired (tapStalled=\(tapStalled) devStalled=\(devStalled)); restoring native playback")
             lastError = "Audio callbacks stalled; restored native playback"
             teardown()
+            tappedObjs = []
+            // Retry one rebuild after a cooldown instead of staying native.
+            lastRebuildAttempt = Date().addingTimeInterval(20)
         }
+    }
+
+    /// Persistent starvation recovery. With the plain FIFO drain, a deep ring
+    /// drain cannot refill by itself (B plays everything available). If B has
+    /// been underrunning continuously for a few seconds while both IOProcs
+    /// are alive, reset the ring and re-prime it (~85 ms of silence) instead
+    /// of playing fragmented audio indefinitely.
+    private func checkStarvationRecovery() {
+        guard aggregateID != AudioObjectID(kAudioObjectUnknown),
+              tapCount.pointee > 0 else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastRefillAttempt) > 10 else { return }
+
+        let devTick = devIOTick.pointee
+        let lastUnderrunTick = diag.lastUnderrunTick.load(ordering: .relaxed)
+        let starvingNow = lastUnderrunTick != 0 && (devTick &- lastUnderrunTick) < 10
+        if !starvingNow {
+            continuousStarvationSince = nil
+            return
+        }
+        if continuousStarvationSince == nil {
+            continuousStarvationSince = now
+            return
+        }
+        guard now.timeIntervalSince(continuousStarvationSince!) > 5 else { return }
+
+        // Starving for >5 s straight: reset the queue and re-prime.
+        let starvedFrames = diag.starvedFrames.load(ordering: .relaxed)
+        DiagLog.log("[PerAppVolume] diag: starvation \(Int(now.timeIntervalSince(continuousStarvationSince!)))s (silence \(starvedFrames) frames); re-priming ring")
+        ringIndex.write.store(0, ordering: .relaxed)
+        ringIndex.read.store(0, ordering: .relaxed)
+        outputPrimed.pointee = 0
+        continuousStarvationSince = nil
+        starvedSince = nil
+        lastRefillAttempt = now
+        lastStatusTime = now
+        lastStatusWrite = 0
+        lastStatusRead = 0
+        lastPolledUnderruns = diag.underruns.load(ordering: .relaxed)
+        lastPolledRingDrops = diag.ringDrops.load(ordering: .relaxed)
     }
 
     /// Poll the IOProc diagnostics counters and NSLog trouble signs: ring
@@ -594,20 +646,27 @@ final class AudioEngine {
             return
         }
 
-        // 2) Private aggregate device collecting only the tap inputs. The
-        // aggregate must never reference the real output device, or it would
-        // take over that device's output path and silence other clients.
+        // 2) Private aggregate device. The real output device is anchored as
+        // the aggregate's main sub-device (SonicFlow-style): the aggregate then
+        // runs on the output device's clock and sample rate, so the capture
+        // half and the playback half share one clock domain — the ring buffer
+        // never drifts and no resampler is needed. (Verified not to hijack the
+        // output path: non-tapped clients keep playing; we only read the tap
+        // inputs.)
+        let outputUID = CADevice.uid(outputDeviceID) ?? ""
         let aggUID = "local.perappvolume.aggregate.\(Int(Date().timeIntervalSince1970 * 1000))"
-        let desc: [String: Any] = [
+        var desc: [String: Any] = [
             kAudioAggregateDeviceNameKey: "PerAppVolume",
             kAudioAggregateDeviceUIDKey: aggUID,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
             kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceTapListKey: tapUIDs.map {
-                [kAudioSubTapUIDKey: $0, kAudioSubTapDriftCompensationKey: true]
-            },
+            kAudioAggregateDeviceTapListKey: tapUIDs.map { [kAudioSubTapUIDKey: $0] },
         ]
+        if !outputUID.isEmpty {
+            desc[kAudioAggregateDeviceMainSubDeviceKey] = outputUID
+            desc[kAudioAggregateDeviceSubDeviceListKey] = [[kAudioSubDeviceUIDKey: outputUID]]
+        }
         var aggID = AudioObjectID(kAudioObjectUnknown)
         let status = AudioHardwareCreateAggregateDevice(desc as CFDictionary, &aggID)
         guard status == noErr, aggID != AudioObjectID(kAudioObjectUnknown) else {
@@ -617,19 +676,8 @@ final class AudioEngine {
             return
         }
         aggregateID = aggID
-
-        // A tap-only aggregate otherwise chooses its own nominal rate. On some
-        // boots that differs from the physical output (commonly 44.1 vs 48 kHz),
-        // making the output drain the ring until playback becomes all silence.
-        // Match the rates first; the adaptive output resampler below handles
-        // the remaining clock drift between the independent devices.
-        let outputRate = CADevice.nominalSampleRate(outputDeviceID)
-        if outputRate > 0 {
-            let setRate = CADevice.setNominalSampleRate(aggID, outputRate)
-            let actualRate = CADevice.nominalSampleRate(aggID)
-            if !setRate || abs(actualRate - outputRate) > 0.5 {
-                DiagLog.log("[PerAppVolume] aggregate rate \(actualRate) could not be aligned to output rate \(outputRate); adaptive resampling enabled")
-            }
+        if outputUID.isEmpty {
+            DiagLog.log("[PerAppVolume] output device has no UID; aggregate not clock-anchored")
         }
 
         // 3) Tap buffer layout.
@@ -645,7 +693,6 @@ final class AudioEngine {
         }
         ringIndex.write.store(0, ordering: .relaxed)
         ringIndex.read.store(0, ordering: .relaxed)
-        resamplePhase.pointee = 0
         outputPrimed.pointee = 0
 
         // 5) IOProc A (aggregate input → mix → ring).
@@ -697,6 +744,7 @@ final class AudioEngine {
         lastPolledTapTick = tapIOTick.pointee
         lastPolledDevTick = devIOTick.pointee
         starvedSince = nil
+        continuousStarvationSince = nil
         lastStatusTime = Date()
         lastStatusWrite = 0
         lastStatusRead = 0
@@ -841,6 +889,13 @@ final class AudioEngine {
     }
 
     /// IOProc B: render ring data into the real output device.
+    ///
+    /// The aggregate is clock-anchored to this same output device (see
+    /// rebuild), so capture and playback share one clock: a plain FIFO drain
+    /// is sufficient — no resampler, no rate controller, nothing that can
+    /// drift or get stuck. A transient input stall briefly underruns (zeros),
+    /// and the recovery check in refresh() re-primes the ring if starvation
+    /// persists.
     private func makeDeviceOutputBlock() -> AudioDeviceIOBlock {
         let ring = self.ring
         let ringIndex = self.ringIndex
@@ -848,7 +903,6 @@ final class AudioEngine {
         let devChannelsP = self.devChannels
         let devInterleavedP = self.devInterleaved
         let devIOTickP = self.devIOTick
-        let resamplePhaseP = self.resamplePhase
         let outputPrimedP = self.outputPrimed
         let targetFrames = Self.targetRingFrames
         let diag = self.diag
@@ -911,28 +965,13 @@ final class AudioEngine {
             if outputPrimedP.pointee == 0 {
                 guard avail >= targetFrames else { return }
                 outputPrimedP.pointee = 1
-                resamplePhaseP.pointee = 0
             }
 
-            // Proportional queue controller. At the target it consumes exactly
-            // one captured frame per output frame. If the ring drains/fills, a
-            // bounded linear resampler consumes slightly slower/faster. The wide
-            // bound also survives a 44.1/48 kHz mismatch if HAL rejected the
-            // aggregate-rate request.
-            let fillError = Double(avail - targetFrames) / Double(targetFrames)
-            let ratio = min(1.15, max(0.85, 1.0 + fillError * 0.25))
-            let startPhase = resamplePhaseP.pointee
-            var produced = 0
-            if avail >= 2 {
-                let maxPosition = Double(avail - 1)
-                while produced < framesOut,
-                      startPhase + Double(produced) * ratio < maxPosition {
-                    produced += 1
-                }
-            }
-            if produced < framesOut {
+            // Plain FIFO drain (one captured frame per output frame).
+            let take = min(avail, framesOut)
+            if take < framesOut {
                 diag.underruns.add(1, ordering: .relaxed)
-                diag.starvedFrames.add(UInt64(framesOut - produced), ordering: .relaxed)
+                diag.starvedFrames.add(UInt64(framesOut - take), ordering: .relaxed)
                 diag.lastUnderrunTick.store(devIOTickP.pointee, ordering: .relaxed)
             }
             let base = Int(r) & (ringSize - 1)
@@ -941,25 +980,17 @@ final class AudioEngine {
                 ring[(base + frame * 2 + channel) & (ringSize - 1)]
             }
 
-            @inline(__always) func interpolated(_ outputFrame: Int, _ channel: Int) -> Float {
-                let position = startPhase + Double(outputFrame) * ratio
-                let frame = Int(position)
-                let fraction = Float(position - Double(frame))
-                let a = ringSample(frame, channel)
-                return a + (ringSample(frame + 1, channel) - a) * fraction
-            }
-
             if interleaved {
                 guard let dstRaw = outBL[0].mData else { return }
                 let dst = dstRaw.assumingMemoryBound(to: Float.self)
                 if chOut == 1 {
-                    for f in 0..<produced {
-                        dst[f] = (interpolated(f, 0) + interpolated(f, 1)) * 0.5
+                    for f in 0..<take {
+                        dst[f] = (ringSample(f, 0) + ringSample(f, 1)) * 0.5
                     }
                 } else {
-                    for f in 0..<produced {
-                        dst[f * chOut] = interpolated(f, 0)
-                        dst[f * chOut + 1] = interpolated(f, 1)
+                    for f in 0..<take {
+                        dst[f * chOut] = ringSample(f, 0)
+                        dst[f * chOut + 1] = ringSample(f, 1)
                     }
                 }
             } else {
@@ -968,20 +999,16 @@ final class AudioEngine {
                     guard let dstRaw = outBL[c].mData else { continue }
                     let dst = dstRaw.assumingMemoryBound(to: Float.self)
                     if c < 2 {
-                        for f in 0..<produced {
-                            dst[f] = interpolated(f, c)
+                        for f in 0..<take {
+                            dst[f] = ringSample(f, c)
                         }
                     }
                 }
             }
 
-            // Keep the fractional source position for the next callback and
-            // advance only by complete captured frames.
-            if produced > 0 {
-                let endPhase = startPhase + Double(produced) * ratio
-                let consumed = min(Int(endPhase), max(0, avail - 1))
-                resamplePhaseP.pointee = endPhase - Double(consumed)
-                ringIndex.read.store(r &+ UInt64(consumed * 2), ordering: .releasing)
+            // Advance the read pointer by the frames actually consumed.
+            if take > 0 {
+                ringIndex.read.store(r &+ UInt64(take * 2), ordering: .releasing)
             }
         }
     }
